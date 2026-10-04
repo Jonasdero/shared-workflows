@@ -1,0 +1,207 @@
+name: Dependabot Auto Merge
+
+# Reusable workflow (workflow_call): merge green, provably non-breaking Dependabot PRs.
+# Call it from a workflow triggered by `workflow_run` of your CI workflow; see README.md.
+# Fail-closed: anything unrecognized, major/0.x-breaking or not green is skipped.
+
+on:
+  workflow_call:
+    inputs:
+      merge-method:
+        description: "Merge method: rebase, squash or merge (anything else refuses to merge)"
+        type: string
+        required: true
+      wait-for-checks:
+        description: "Newline-separated check-run names that must reach success before merging (empty = no wait)"
+        type: string
+        required: false
+        default: ""
+      wait-timeout-minutes:
+        description: "Max minutes to wait for wait-for-checks"
+        type: number
+        required: false
+        default: 15
+
+# Caps only: the caller's permissions are the upper bound for a called workflow.
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+
+jobs:
+  auto-merge:
+    runs-on: ubuntu-latest
+    # GitHub expressions have no arithmetic, so this is a fixed ceiling; keep wait-timeout-minutes below it.
+    timeout-minutes: 120
+    # github.event is the CALLER's event (workflow_run) inside a called workflow.
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.actor.login == 'dependabot[bot]'
+    steps:
+      - name: Merge green Dependabot PR (skip major bumps)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.event.workflow_run.head_branch }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          MERGE_METHOD: ${{ inputs.merge-method }}
+          WAIT_FOR_CHECKS: ${{ inputs.wait-for-checks }}
+          WAIT_TIMEOUT_MINUTES: ${{ inputs.wait-timeout-minutes }}
+        run: |
+          # Inputs arrive via env only (never interpolated into this script).
+          # Fail closed on an invalid merge method before touching anything.
+          case "${MERGE_METHOD:-}" in
+            rebase|squash|merge) ;;
+            *) printf 'Invalid merge-method "%s" (allowed: rebase, squash, merge): refusing to merge\n' "${MERGE_METHOD:-}"; exit 1 ;;
+          esac
+          NUM=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open --json number --jq '.[0].number // empty')
+          if [ -z "$NUM" ]; then echo "No open PR for $BRANCH"; exit 0; fi
+          TITLE=$(gh pr view "$NUM" --repo "$REPO" --json title --jq .title)
+          echo "PR #$NUM: $TITLE"
+          # Fail-closed major guard. Merge only when the title proves a non-major bump:
+          # 1. Dependabot group PR ("bump the X group ..."): Dependabot calls 0.x minor bumps
+          #    "minor", so update-types in dependabot.yml is not enough. Parse the PR body
+          #    (awk only, never eval'd): every top-level table row / "Updates `x` from A to B"
+          #    line must parse, distinct packages == declared "group with N updates" total,
+          #    and each entry keeps its major (0.x: minor, 0.0.x: patch) -> else skip.
+          # 2. "from <ver> to <ver>" (prefixes v ^ ~ >= = and quotes allowed):
+          #    compare the first two numeric components of each: major differs -> skip;
+          #    0.x (major 0 on both) with differing minor -> skip (0.x minor is breaking);
+          #    missing minor counts as 0; otherwise -> allow.
+          # 3. Anything else (multi-dependency titles, unknown format) -> skip.
+          # Never merge on parse failure. Title is never interpolated into shell code (printf '%s' only).
+          if printf '%s' "$TITLE" | grep -qiE 'bump the .+ group'; then
+            BODY_FILE="$RUNNER_TEMP/dependabot-pr-body.md"
+            if ! gh pr view "$NUM" --repo "$REPO" --json body --jq .body > "$BODY_FILE"; then
+              echo "Could not read PR body: leaving for manual review"; exit 0
+            fi
+            if ! LC_ALL=C awk '
+              function trim(s) { gsub(/^[ \t]+/, "", s); gsub(/[ \t]+$/, "", s); return s }
+              function clean(s) { gsub(/[^ -~]/, "?", s); return substr(s, 1, 120) }
+              # Sets VMAJ/VMIN/VPAT; returns 0 when the version is not plain numeric semver-ish.
+              function parsever(v,    n, a) {
+                v = trim(v); gsub(/`/, "", v); v = trim(v)
+                sub(/^[v=~>^ ]+/, "", v)
+                if (v !~ /^[0-9]+(\.[0-9]+)*([-+][0-9A-Za-z.+-]+)?$/) return 0
+                sub(/[-+].*$/, "", v)
+                n = split(v, a, ".")
+                if (n > 4 || length(a[1]) > 9) return 0
+                VMAJ = a[1] + 0; VMIN = (n >= 2) ? a[2] + 0 : 0; VPAT = (n >= 3) ? a[3] + 0 : 0
+                return 1
+              }
+              function entry(name, f, t,    fM, fm, fp) {
+                gsub(/`/, "", f); f = trim(f); gsub(/`/, "", t); t = trim(t)
+                name = trim(name)
+                if (substr(name, 1, 1) == "[") { name = substr(name, 2); sub(/\]\(.*$/, "", name) }
+                gsub(/`/, "", name); name = trim(name)
+                if (name == "") { bad++; print "  - unparseable entry (empty package name)"; return }
+                entries++
+                if (!(name in seen)) { seen[name] = 1; uniq++ }
+                if (!parsever(f)) { bad++; printf "  - %s: unparseable from-version \"%s\"\n", clean(name), clean(f); return }
+                fM = VMAJ; fm = VMIN; fp = VPAT
+                if (!parsever(t)) { bad++; printf "  - %s: unparseable to-version \"%s\"\n", clean(name), clean(t); return }
+                if (fM != VMAJ) { brk++; printf "  - %s: major bump %s -> %s\n", clean(name), clean(f), clean(t) }
+                else if (VMAJ == 0 && fm != VMIN) { brk++; printf "  - %s: 0.x minor bump %s -> %s (breaking)\n", clean(name), clean(f), clean(t) }
+                else if (VMAJ == 0 && VMIN == 0 && fp != VPAT) { brk++; printf "  - %s: 0.0.x bump %s -> %s (breaking)\n", clean(name), clean(f), clean(t) }
+              }
+              BEGIN { depth = 0; headers = 0; decl = 0; entries = 0; uniq = 0; bad = 0; brk = 0 }
+              {
+                line = $0; sub(/\r$/, "", line)
+                if (depth == 0) {
+                  if (line ~ /^Bumps the .* group with [0-9]+ updates?([ :.,]|$)/) {
+                    n = line; sub(/^.* group with /, "", n); sub(/[^0-9].*$/, "", n)
+                    if (length(n) > 6) { bad++; print "  - absurd update count" } else { decl += n + 0; headers++ }
+                  } else if (line ~ /^Bumps /) {
+                    bad++; print "  - unrecognized Bumps line"
+                  } else if (line ~ /^\|/) {
+                    if (line ~ /^\|[ ]*Package[ ]*\|[ ]*From[ ]*\|[ ]*To[ ]*\|[ ]*$/ || line ~ /^\|[ :-]+\|[ :-]+\|[ :-]+\|[ ]*$/) next
+                    nc = split(line, c, "|")
+                    if (nc != 5 || trim(c[5]) != "") { bad++; print "  - unparseable table row"; next }
+                    entry(c[2], c[3], c[4])
+                  } else if (line ~ /^Updates `[^`]+` from [^ ]+ to [^ ]+[ ]*$/) {
+                    rest = substr(line, 10); i = index(rest, "`"); name = substr(rest, 1, i - 1)
+                    rest = substr(rest, i + 7); j = index(rest, " to ")
+                    entry(name, substr(rest, 1, j - 1), substr(rest, j + 4))
+                  } else if (line ~ /^Updates `/) {
+                    bad++; print "  - unparseable Updates line (no plain from/to versions)"
+                  }
+                }
+                t = line; o = gsub(/<details/, "", t); cl = gsub(/<\/details>/, "", t)
+                # Dependabot never nests <details>; unbalanced/nested tags (e.g. from upstream release notes)
+                # could desync depth and hide real rows -> treat as unparseable (fail closed).
+                if (depth + o > 1 || depth - cl < 0) { if (!desync) { bad++; desync = 1; print "  - unbalanced or nested <details> (cannot trust structure)" } }
+                depth += o - cl; if (depth < 0) depth = 0
+              }
+              END {
+                if (headers == 0) { print "SKIP: no \"Bumps the ... group with N updates\" header found"; exit 1 }
+                if (decl < 1) { print "SKIP: declared update count is zero"; exit 1 }
+                if (entries == 0) { print "SKIP: no dependency rows parsed"; exit 1 }
+                if (bad > 0) { printf "SKIP: %d unparseable line(s)\n", bad; exit 1 }
+                if (uniq != decl) { printf "SKIP: parsed %d distinct packages but header declares %d (truncated or unknown format)\n", uniq, decl; exit 1 }
+                if (brk > 0) { printf "SKIP: %d breaking bump(s) (major, 0.x minor or 0.0.x)\n", brk; exit 1 }
+                printf "ALLOW: %d packages (%d entries), all non-breaking\n", uniq, entries
+                exit 0
+              }' "$BODY_FILE"; then
+              echo "Group PR not provably non-breaking: leaving for manual review"; exit 0
+            fi
+          else
+            FROM=$(printf '%s' "$TITLE" | grep -oiE 'from [^0-9 ]*[0-9]+(\.[0-9]+)?' | head -1 | grep -oE '[0-9]+(\.[0-9]+)?$' || true)
+            TO=$(printf '%s' "$TITLE" | grep -oiE ' to [^0-9 ]*[0-9]+(\.[0-9]+)?' | head -1 | grep -oE '[0-9]+(\.[0-9]+)?$' || true)
+            if [ -z "$FROM" ] || [ -z "$TO" ]; then
+              echo "Unrecognized title: leaving for manual review"; exit 0
+            fi
+            FROM_MAJOR=${FROM%%.*}; TO_MAJOR=${TO%%.*}
+            FROM_MINOR=0; case "$FROM" in *.*) FROM_MINOR=${FROM#*.} ;; esac
+            TO_MINOR=0; case "$TO" in *.*) TO_MINOR=${TO#*.} ;; esac
+            if [ "$FROM_MAJOR" != "$TO_MAJOR" ]; then
+              echo "Major bump ($FROM -> $TO): leaving for manual review"; exit 0
+            fi
+            if [ "$FROM_MAJOR" = 0 ] && [ "$FROM_MINOR" != "$TO_MINOR" ]; then
+              echo "0.x minor bump ($FROM -> $TO) is breaking: leaving for manual review"; exit 0
+            fi
+          fi
+          # Optional gate: every check run named in WAIT_FOR_CHECKS (one per line) must be
+          # completed + success on the PR head commit. Polls until WAIT_TIMEOUT_MINUTES elapsed
+          # (always at least one look). API errors, non-success conclusions and timeouts skip.
+          if [ -n "$(printf '%s' "${WAIT_FOR_CHECKS:-}" | tr -d '[:space:]')" ]; then
+            case "${WAIT_TIMEOUT_MINUTES:-}" in
+              ''|*[!0-9]*) echo "Invalid wait-timeout-minutes: skipping (manual review)"; exit 0 ;;
+            esac
+            INTERVAL=${POLL_INTERVAL_SECONDS:-30}
+            case "$INTERVAL" in ''|*[!0-9]*) INTERVAL=30 ;; esac
+            DEADLINE=$((SECONDS + WAIT_TIMEOUT_MINUTES * 60))
+            READY=0
+            while :; do
+              if ! RUNS=$(gh api "repos/$REPO/commits/$HEAD_SHA/check-runs" --paginate \
+                --jq '.check_runs[] | [.name, .status, (.conclusion // "none")] | @tsv'); then
+                echo "gh api failed while reading check runs: skipping (manual review)"; exit 0
+              fi
+              WAITING=0
+              while IFS= read -r NAME; do
+                NAME=${NAME%$'\r'}
+                [ -n "$(printf '%s' "$NAME" | tr -d '[:space:]')" ] || continue
+                FOUND=0
+                while IFS=$'\t' read -r RNAME RSTATUS RCONCLUSION; do
+                  [ "$RNAME" = "$NAME" ] || continue
+                  FOUND=1
+                  if [ "$RSTATUS" != "completed" ]; then
+                    WAITING=1
+                  elif [ "$RCONCLUSION" != "success" ]; then
+                    printf '%s concluded %s: skipping (manual review)\n' "$RNAME" "$RCONCLUSION"; exit 0
+                  fi
+                done <<< "$RUNS"
+                if [ "$FOUND" -eq 0 ]; then WAITING=1; fi
+              done <<< "$WAIT_FOR_CHECKS"
+              if [ "$WAITING" -eq 0 ]; then READY=1; break; fi
+              if [ "$SECONDS" -ge "$DEADLINE" ]; then break; fi
+              echo "Required checks still pending, waiting ${INTERVAL}s"
+              sleep "$INTERVAL"
+            done
+            if [ "$READY" -ne 1 ]; then
+              echo "Required checks not successful within ${WAIT_TIMEOUT_MINUTES} min: skipping (manual review)"; exit 0
+            fi
+            echo "All required checks succeeded"
+          fi
+
+          gh pr merge "--$MERGE_METHOD" --match-head-commit "$HEAD_SHA" --repo "$REPO" "$NUM"
