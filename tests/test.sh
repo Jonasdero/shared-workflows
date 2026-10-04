@@ -74,7 +74,7 @@ run_workflow() {
   : > "$WORK/merge.log"
   ( cd "$WORK/cwd" && env PATH="$pathpre:$PATH" REPO=o/r BRANCH=dependabot/x GH_TOKEN=x HEAD_SHA=abc123 \
       MERGE_METHOD="${MERGE_METHOD-rebase}" WAIT_FOR_CHECKS="${WAIT_FOR_CHECKS:-}" \
-      WAIT_TIMEOUT_MINUTES="${WAIT_TIMEOUT_MINUTES:-15}" POLL_INTERVAL_SECONDS="${POLL_INTERVAL_SECONDS:-0}" \
+      WAIT_APP="${WAIT_APP:-}" WAIT_TIMEOUT_MINUTES="${WAIT_TIMEOUT_MINUTES:-15}" POLL_INTERVAL_SECONDS="${POLL_INTERVAL_SECONDS:-0}" \
       RUNNER_TEMP="$WORK" STUB_TITLE="$1" STUB_BODY="$2" STUB_LOG="$WORK/merge.log" \
       STUB_CHECKS_DIR="$WORK/checks" STUB_API_FAIL="${STUB_API_FAIL:-0}" \
       STUB_BODY_FAIL="${STUB_BODY_FAIL:-0}" bash -e "$WORK/run.sh" ) > "$WORK/wf.out" 2>&1
@@ -103,6 +103,13 @@ for AD in "${AWKDIRS[@]}"; do
   done
 
   for case in "merged|chore(deps): bump astro from 7.3.1 to 7.4.0" \
+              "merged|chore(deps): bump x from v4.1.0 to v4.2.0" \
+              "merged|chore(deps): bump x from ^1.2.0 to ^1.3.0" \
+              "skipped|chore(deps): bump actions/checkout from 1bd719a to 1af3b93" \
+              "skipped|chore(deps): bump x from a1b2c3d to e1f9a8b" \
+              "skipped|chore(deps): bump x from 1.2.3 to 1.2.4abc" \
+              "skipped|chore(deps): bump x from 0.3.1 to 0.4.0" \
+              "skipped|chore(deps): bump x from v1.9.0 to v2.0.0" \
               "skipped|chore(deps): bump drizzle-kit from 0.24.2 to 0.31.4" \
               "skipped|chore(deps): bump recharts from 2.12.7 to 3.10.1" \
               "merged|chore(deps): bump resend from 6.30.0 to 6.31.0 in the all-dependencies group" \
@@ -127,7 +134,7 @@ for m in "" "REBASE" "rebase --admin" "--auto" "fast-forward" '$(touch PWNED)'; 
 done
 
 # ---- wait-for-checks ----
-CHK_OK='A build\tcompleted\tsuccess\nB build\tcompleted\tsuccess\nunrelated\tcompleted\tfailure\n'
+CHK_OK='A build\tapp1\tcompleted\tsuccess\nB build\tapp1\tcompleted\tsuccess\nunrelated\tapp1\tcompleted\tfailure\n'
 set_checks "$CHK_OK"   # not consulted when wait list empty
 wgot=$(WAIT_FOR_CHECKS="" run_workflow "$WORK/title-ok" /dev/null system)
 [ "$wgot" = merged ] && [ ! -e "$WORK/checks/.count" ] && ok || ko "empty wait-for-checks: expected merged w/o api calls, got $wgot"
@@ -139,32 +146,32 @@ wgot=$(WAIT_FOR_CHECKS=$'A build\nB build' run_workflow "$WORK/title-ok" /dev/nu
 [ "$wgot" = merged ] && ok || ko "wait success: got $wgot :: $(tail -2 "$WORK/wf.out")"
 
 # pending twice, then success -> merged after polling
-set_checks 'A build\tin_progress\tnone\n' 'A build\tqueued\tnone\nB build\tcompleted\tsuccess\n' 'A build\tcompleted\tsuccess\nB build\tcompleted\tsuccess\n'
+set_checks 'A build\tapp1\tin_progress\tnone\n' 'A build\tapp1\tqueued\tnone\nB build\tapp1\tcompleted\tsuccess\n' 'A build\tapp1\tcompleted\tsuccess\nB build\tapp1\tcompleted\tsuccess\n'
 wgot=$(WAIT_FOR_CHECKS=$'A build\nB build' WAIT_TIMEOUT_MINUTES=1 run_workflow "$WORK/title-ok" /dev/null system)
 [ "$wgot" = merged ] && [ "$(cat "$WORK/checks/.count")" = 3 ] && ok || ko "pending then success: got $wgot count=$(cat "$WORK/checks/.count" 2>/dev/null)"
 
 # pending until timeout (0 min = single look) -> skipped, step green
-set_checks 'A build\tin_progress\tnone\nB build\tcompleted\tsuccess\n'
+set_checks 'A build\tapp1\tin_progress\tnone\nB build\tapp1\tcompleted\tsuccess\n'
 wgot=$(WAIT_FOR_CHECKS=$'A build\nB build' WAIT_TIMEOUT_MINUTES=0 run_workflow "$WORK/title-ok" /dev/null system)
 [ "$wgot" = skipped ] && ok || ko "pending timeout: expected skipped got $wgot"
 # required check never appears -> skipped
-set_checks 'B build\tcompleted\tsuccess\n'
+set_checks 'B build\tapp1\tcompleted\tsuccess\n'
 wgot=$(WAIT_FOR_CHECKS=$'A build\nB build' WAIT_TIMEOUT_MINUTES=0 run_workflow "$WORK/title-ok" /dev/null system)
 [ "$wgot" = skipped ] && ok || ko "missing check: expected skipped got $wgot"
 # real timeout with polling: 1 min is too slow; use bash SECONDS-free check via interval 1, minutes 0 -> single look only (covered above)
 
 # failure / cancelled / neutral -> skipped
 for c in failure cancelled neutral skipped timed_out; do
-  set_checks "A build\\tcompleted\\t$c\\nB build\\tcompleted\\tsuccess\\n"
+  set_checks "A build\tapp1\tcompleted\\t$c\\nB build\tapp1\tcompleted\\tsuccess\\n"
   wgot=$(WAIT_FOR_CHECKS=$'A build\nB build' run_workflow "$WORK/title-ok" /dev/null system)
   [ "$wgot" = skipped ] && ok || ko "conclusion $c: expected skipped got $wgot"
 done
 # any non-success among duplicate runs of the same name (rerun) -> skipped
-set_checks 'A build\tcompleted\tfailure\nA build\tcompleted\tsuccess\n'
+set_checks 'A build\tapp1\tcompleted\tfailure\nA build\tapp1\tcompleted\tsuccess\n'
 wgot=$(WAIT_FOR_CHECKS='A build' run_workflow "$WORK/title-ok" /dev/null system)
 [ "$wgot" = skipped ] && ok || ko "duplicate runs w/ failure: expected skipped got $wgot"
 # name must match exactly (prefix is not enough)
-set_checks 'A build 2\tcompleted\tsuccess\n'
+set_checks 'A build 2\tapp1\tcompleted\tsuccess\n'
 wgot=$(WAIT_FOR_CHECKS='A build' WAIT_TIMEOUT_MINUTES=0 run_workflow "$WORK/title-ok" /dev/null system)
 [ "$wgot" = skipped ] && ok || ko "prefix name match: expected skipped got $wgot"
 # api failure / bad timeout -> skipped
@@ -173,6 +180,21 @@ wgot=$(STUB_API_FAIL=1 WAIT_FOR_CHECKS='A build' run_workflow "$WORK/title-ok" /
 [ "$wgot" = skipped ] && ok || ko "api failure: expected skipped got $wgot"
 wgot=$(WAIT_FOR_CHECKS='A build' WAIT_TIMEOUT_MINUTES='1; touch PWNED' run_workflow "$WORK/title-ok" /dev/null system)
 [ "$wgot" = skipped ] && ok || ko "bad timeout: expected skipped got $wgot"
+# wait-for-checks-app: slug must match exactly; empty = name-only
+set_checks 'A build\tapp1\tcompleted\tsuccess\n'
+wgot=$(WAIT_APP=other-app WAIT_FOR_CHECKS='A build' WAIT_TIMEOUT_MINUTES=0 run_workflow "$WORK/title-ok" /dev/null system)
+[ "$wgot" = skipped ] && ok || ko "app mismatch: expected skipped got $wgot"
+wgot=$(WAIT_APP=app1 WAIT_FOR_CHECKS='A build' run_workflow "$WORK/title-ok" /dev/null system)
+[ "$wgot" = merged ] && ok || ko "app match: expected merged got $wgot"
+wgot=$(WAIT_APP=app WAIT_FOR_CHECKS='A build' WAIT_TIMEOUT_MINUTES=0 run_workflow "$WORK/title-ok" /dev/null system)
+[ "$wgot" = skipped ] && ok || ko "app prefix: expected skipped got $wgot"
+# wrong-app impostor does not satisfy, even next to a failing real one
+set_checks 'A build\tevil\tcompleted\tsuccess\nA build\tapp1\tin_progress\tnone\n'
+wgot=$(WAIT_APP=app1 WAIT_FOR_CHECKS='A build' WAIT_TIMEOUT_MINUTES=0 run_workflow "$WORK/title-ok" /dev/null system)
+[ "$wgot" = skipped ] && ok || ko "impostor: expected skipped got $wgot"
+set_checks 'A build\tapp1\tcompleted\tsuccess\n'
+wgot=$(WAIT_FOR_CHECKS='A build' run_workflow "$WORK/title-ok" /dev/null system)
+[ "$wgot" = merged ] && ok || ko "empty app: expected merged got $wgot"
 # wait gate never bypasses the major guard
 set_checks "$CHK_OK"
 printf 'chore(deps): bump recharts from 2.12.7 to 3.10.1' > "$WORK/title-major"
